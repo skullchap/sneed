@@ -1,5 +1,5 @@
 /*
- * SNEED SERVER - v0.0.1 - C89 ANSI POSIX1 concurrent file server.
+ * SNEED SERVER - v0.0.1 (non-select version) - C89 ANSI POSIX1 concurrent file server.
  *
  * MIT LICENSE
  *
@@ -31,20 +31,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #define SERVER_PORT 8888
-#define BUFFER_SIZE 8192
-#define TIMEOUT_SEC 5
-
-void
-print_usage(char *program_name)
-{
-        fprintf(stderr, "Usage: %s [-d directory] [-i initialfile] [-p port]\n", program_name);
-}
+#define BUFFER_SIZE 4096
 
 typedef struct task {
         int          fd, active;
@@ -55,8 +47,12 @@ typedef struct task {
 
 task_t *head = NULL;
 
-task_t *
-create_task(int client_sock);
+void
+print_usage(char *program_name)
+{
+        fprintf(stderr, "Usage: %s [-d directory] [-i initialfile] [-p port]\n", program_name);
+}
+
 void
 add_task(task_t *task);
 void
@@ -94,10 +90,7 @@ main(int argc, char *argv[])
         int                server_sock, client_sock, flags;
         struct sockaddr_in client_addr;
         socklen_t          client_addr_len = sizeof(client_addr);
-        task_t            *task, *new_task;
-        fd_set             read_fds;
-        int                max_fd;
-        struct timeval     timeout;
+        task_t            *new_task;
 
         parse_arguments(argc, argv);
         signal(SIGPIPE, SIG_IGN);
@@ -108,73 +101,45 @@ main(int argc, char *argv[])
                 exit(EXIT_FAILURE);
         }
 
-        timeout.tv_sec = TIMEOUT_SEC;
-        timeout.tv_usec = 0;
-
         while (1) {
-                FD_ZERO(&read_fds);
-                FD_SET(server_sock, &read_fds);
-                max_fd = server_sock;
-
-                for (task = head; task; task = task->next) {
-                        if (task->active) {
-                                FD_SET(task->fd, &read_fds);
-                                if (task->fd > max_fd) {
-                                        max_fd = task->fd;
-                                }
+                client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_len);
+                if (client_sock < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                /* These errors are normal with non-blocking sockets. Just try again. */
+                        } else {
+                                perror("Error accepting connection");
                         }
-                }
-
-                if (select(max_fd + 1, &read_fds, NULL, NULL, &timeout) < 0) {
-                        perror("select error");
+                        schedule_tasks();
+                        /* usleep_milliseconds(100); */
                         continue;
                 }
 
-                if (FD_ISSET(server_sock, &read_fds)) {
-                        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_len);
-                        if (client_sock >= 0) {
-                                flags = fcntl(client_sock, F_GETFL, 0);
-                                if (flags < 0 || fcntl(client_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
-                                        perror("Error setting O_NONBLOCK on client socket");
-                                        close(client_sock);
-                                        continue;
-                                }
-                                new_task = create_task(client_sock);
-                                if (new_task) {
-                                        add_task(new_task);
-                                }
-                        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                                perror("Error accepting connection");
-                        }
+                /* Set the client socket to non-blocking mode */
+                flags = fcntl(client_sock, F_GETFL, 0);
+                if (flags < 0 || fcntl(client_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+                        perror("Error setting O_NONBLOCK on client socket");
+                        close(client_sock);
+                        continue;
                 }
 
-                for (task = head; task; task = task->next) {
-                        if (task->active && FD_ISSET(task->fd, &read_fds)) {
-                                serve_client(task);
-                        }
+                new_task = (task_t *)malloc(sizeof(task_t));
+                if (!new_task) {
+                        perror("Error allocating memory for new task");
+                        close(client_sock);
+                        continue;
                 }
 
+                new_task->active = 1;
+                new_task->fd = client_sock;
+                new_task->file_stream = NULL;
+
+                add_task(new_task);
                 schedule_tasks();
         }
 
+        /* Not reached */
         close(server_sock);
         return 0;
-}
-
-task_t *
-create_task(int client_sock)
-{
-        task_t *new_task = (task_t *)malloc(sizeof(task_t));
-        if (!new_task) {
-                perror("Error allocating memory for new task");
-                close(client_sock);
-                return NULL;
-        }
-
-        new_task->active = 1;
-        new_task->fd = client_sock;
-        new_task->file_stream = NULL;
-        return new_task;
 }
 
 void
@@ -505,7 +470,7 @@ send_directory_listing(int fd, const char *directory_path, const char *relative_
                         sprintf(link, "%s%s", relative_path, entry->d_name);
                 }
 
-                entry_len = strlen(link) * 2 + 50; /* Approximation for the entry */
+                entry_len = strlen(link) * 2 + 50;
 
                 if (bytes_used + entry_len > html_size) {
                         html_size *= 2;
@@ -524,7 +489,7 @@ send_directory_listing(int fd, const char *directory_path, const char *relative_
                 strcat(html_response, "\">");
                 strcat(html_response, entry->d_name);
                 if (S_ISDIR(entry_stat.st_mode)) {
-                        strcat(html_response, "/"); /* Append '/' to display name if it's a directory */
+                        strcat(html_response, "/");
                 }
                 strcat(html_response, "</a></li>");
                 bytes_used += entry_len;
