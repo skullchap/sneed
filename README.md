@@ -10,5 +10,5 @@ Usage: [-d directory] [-i initialfile] [-p port]
 Compile: cc sneed.c
 ```
 
-*there is also non-select branch too*
+*there is also non-select branch*
 
